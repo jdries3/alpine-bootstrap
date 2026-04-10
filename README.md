@@ -27,6 +27,8 @@ chmod +x alpine-bootstrap.sh
 
 **Container Runtime:** Podman (default) or Docker with Docker-compatible socket
 
+**Guest Integration:** qemu-guest-agent
+
 **CLI Tools:** atuin, btop, curl, dust, eza, fzf, jq, lazydocker, nushell, ripgrep, starship, trippy, wget, yq-go, zellij
 
 **Shells:** Fish + Bash (both with completions for installed tools)
