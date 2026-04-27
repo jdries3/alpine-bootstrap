@@ -12,6 +12,8 @@ set -eu
 #   ./alpine-bootstrap.sh --skip-ssh-keys           # Skip GitHub key bootstrap
 #   ./alpine-bootstrap.sh --run-setup-apkrepos      # Opt-in: run setup-apkrepos helper
 #   ./alpine-bootstrap.sh --force-engine-switch     # Allow switching from saved engine choice
+#   ./alpine-bootstrap.sh --force-storage-backend-switch
+#                                                  # Allow risky storage backend changes
 #   ./alpine-bootstrap.sh --no-bash                 # Skip Bash tooling install
 #   ./alpine-bootstrap.sh --no-fish                 # Skip Fish install/config
 #   ./alpine-bootstrap.sh --no-color                # Disable colored output
@@ -32,11 +34,13 @@ LOG_PREFIX="[alpine-bootstrap]"
 # Package sets (whitespace/newline separated for easy editing)
 BASE_PACKAGES="
 atuin
+bat
 btop
 curl
 dbus
 dust
 eza
+fastfetch
 fuse-overlayfs
 fzf
 jq
@@ -55,6 +59,7 @@ zellij
 
 PODMAN_PACKAGES="
 podman
+podman-openrc
 podman-compose
 podman-tui
 iptables
@@ -64,8 +69,9 @@ slirp4netns
 
 DOCKER_PACKAGES="
 docker
+docker-openrc
 docker-cli
-docker-compose
+docker-cli-compose
 containerd
 iptables
 ip6tables
@@ -107,6 +113,7 @@ DISABLE_TESTING_REPOS=0
 SKIP_SSH_KEYS=0
 RUN_SETUP_APKREPOS=0
 FORCE_ENGINE_SWITCH=0
+FORCE_STORAGE_BACKEND_SWITCH=0
 INSTALL_BASH=1
 INSTALL_FISH=1
 BASH_SET_BY_CLI=0
@@ -114,6 +121,8 @@ FISH_SET_BY_CLI=0
 
 # Global: set by determine_engine; avoids command-substitution stdout capture
 SELECTED_ENGINE=""
+CONTAINER_PRIVILEGE_MODE=""
+CONTAINER_ENVIRONMENT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -124,6 +133,8 @@ Usage: $(basename "$0") [options]
 Options:
     --engine <podman|docker>   Use a specific container engine
     --force-engine-switch      Allow switching from saved engine selection
+    --force-storage-backend-switch
+                                Allow risky container storage backend changes
     --disable-testing-repos    Disable edge/testing repository entries
     --run-setup-apkrepos       Run setup-apkrepos helper (interactive when available)
     --skip-setup-apkrepos      Backward-compatible no-op (skipping is default)
@@ -167,6 +178,10 @@ EOF
     ;;
   --force-engine-switch)
     FORCE_ENGINE_SWITCH=1
+    shift
+    ;;
+  --force-storage-backend-switch)
+    FORCE_STORAGE_BACKEND_SWITCH=1
     shift
     ;;
   --no-color)
@@ -337,16 +352,52 @@ END {
   mv "${temp_file}" "${file_path}"
 }
 
+remove_toml_key() {
+  local file_path="$1"
+  local section="$2"
+  local key="$3"
+  local temp_file
+
+  if [ ! -f "${file_path}" ]; then
+    return 0
+  fi
+
+  backup_once "${file_path}"
+  temp_file="$(mktemp)"
+
+  awk -v section="${section}" -v key="${key}" '
+BEGIN {
+    in_section = 0
+}
+{
+    if ($0 ~ /^\[[^]]+\][[:space:]]*$/) {
+        in_section = ($0 == section)
+        print
+        next
+    }
+
+    if (in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
+        next
+    }
+
+    print
+}
+' "${file_path}" >"${temp_file}"
+
+  mv "${temp_file}" "${file_path}"
+}
+
 ensure_docker_storage_driver() {
+  local driver="$1"
   local file_path="/etc/docker/daemon.json"
   local temp_file
 
   mkdir -p /etc/docker
 
   if [ ! -f "${file_path}" ] || [ ! -s "${file_path}" ]; then
-    cat >"${file_path}" <<'EOF'
+    cat >"${file_path}" <<EOF
 {
-  "storage-driver": "fuse-overlayfs"
+  "storage-driver": "${driver}"
 }
 EOF
     return 0
@@ -355,13 +406,13 @@ EOF
   backup_once "${file_path}"
 
   if grep -Eq '"storage-driver"[[:space:]]*:' "${file_path}"; then
-    sed -E '0,/"storage-driver"[[:space:]]*:[[:space:]]*"[^"]*"/s//"storage-driver": "fuse-overlayfs"/' "${file_path}" >"${file_path}.tmp"
+    sed -E "0,/\"storage-driver\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"storage-driver\": \"${driver}\"/" "${file_path}" >"${file_path}.tmp"
     mv "${file_path}.tmp" "${file_path}"
     return 0
   fi
 
   temp_file="$(mktemp)"
-  awk '
+  awk -v driver="${driver}" '
 { lines[NR] = $0 }
 END {
     close_idx = 0
@@ -374,7 +425,7 @@ END {
 
     if (close_idx == 0) {
         print "{"
-        print "  \"storage-driver\": \"fuse-overlayfs\""
+        print "  \"storage-driver\": \"" driver "\""
         print "}"
         exit
     }
@@ -392,12 +443,12 @@ END {
 
         if (i == close_idx) {
             if (prev >= 1 && lines[prev] ~ /{[[:space:]]*$/) {
-                print "  \"storage-driver\": \"fuse-overlayfs\""
+                print "  \"storage-driver\": \"" driver "\""
             } else if (prev < 1) {
                 print "{"
-                print "  \"storage-driver\": \"fuse-overlayfs\""
+                print "  \"storage-driver\": \"" driver "\""
             } else {
-                print "  \"storage-driver\": \"fuse-overlayfs\""
+                print "  \"storage-driver\": \"" driver "\""
             }
             print lines[i]
             continue
@@ -411,43 +462,90 @@ END {
   mv "${temp_file}" "${file_path}"
 }
 
+is_service_available() {
+  local service_name="$1"
+
+  rc-service --list 2>/dev/null |
+    awk '{print $1}' |
+    grep -Fxq -- "${service_name}"
+}
+
+is_service_enabled() {
+  local service_name="$1"
+  local runlevel="${2:-default}"
+
+  rc-update show "${runlevel}" 2>/dev/null |
+    awk -F'|' '
+      NF > 0 {
+        service = $1
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", service)
+        if (service != "") {
+          print service
+        }
+      }
+    ' |
+    grep -Fxq -- "${service_name}"
+}
+
+is_service_started() {
+  local service_name="$1"
+
+  rc-service "${service_name}" status >/dev/null 2>&1
+}
+
 # Enable and start an OpenRC service
 enable_service() {
   local service_name="$1"
   local display_name="${2:-$service_name}"
 
   # Check if service exists
-  if ! rc-service --list 2>/dev/null | grep -q "${service_name}"; then
+  if ! is_service_available "${service_name}"; then
     log_warn "Service '${service_name}' not found, skipping"
     return 1
   fi
 
-  # Add to default runlevel if not already enabled
-  if ! rc-update show default 2>/dev/null | grep -q -w "${service_name}"; then
-    rc-update add "${service_name}" default
-    log_info "Enabled ${display_name} service"
+  # Add to default runlevel only when needed.
+  if is_service_enabled "${service_name}" default; then
+    log_info "${display_name} service already enabled in default runlevel"
+  else
+    # Re-check after a failed add so OpenRC's benign "already installed ...
+    # skipping" cases remain successful.
+    if rc-update add "${service_name}" default >/dev/null 2>&1; then
+      log_info "Enabled ${display_name} service"
+    elif is_service_enabled "${service_name}" default; then
+      log_info "${display_name} service already enabled in default runlevel"
+    else
+      log_warn "Failed to enable ${display_name} service"
+      return 1
+    fi
   fi
 
-  # Start the service
-  if rc-service "${service_name}" start 2>/dev/null; then
+  # Starting an already-running service is an acceptable no-op.
+  if is_service_started "${service_name}"; then
+    log_info "${display_name} service already started"
     return 0
-  else
-    log_warn "Failed to start ${display_name} service"
-    return 1
   fi
+
+  if rc-service "${service_name}" start 2>/dev/null; then
+    log_info "Started ${display_name} service"
+    return 0
+  fi
+
+  # Some init scripts return non-zero even though the service reaches running
+  # state; prefer observed state over the start command's exit code.
+  if is_service_started "${service_name}"; then
+    log_info "${display_name} service already started"
+    return 0
+  fi
+
+  log_warn "Failed to start ${display_name} service (it may require a reboot or different runtime environment)"
+  return 1
 }
 
 normalize_package_name() {
   local pkg="$1"
   # Strip repo selector suffix (e.g., trippy@testing -> trippy)
   printf "%s\n" "${pkg%@*}"
-}
-
-is_package_installed() {
-  local pkg_raw="$1"
-  local pkg
-  pkg="$(normalize_package_name "${pkg_raw}")"
-  apk info -e "${pkg}" >/dev/null 2>&1
 }
 
 install_package_set() {
@@ -471,28 +569,24 @@ install_package_set() {
       ;;
     esac
 
-    if is_package_installed "${pkg}"; then
-      continue
-    fi
-
     install_list="${install_list} ${pkg}"
     has_packages=1
   done
 
   if [ "${has_packages}" != "1" ]; then
-    log_info "All ${set_name} are already installed; skipping"
+    log_info "No ${set_name} selected for installation; skipping"
     return 0
   fi
 
-  log_info "Packages queued for ${set_name}:"
+  log_info "Packages requested for ${set_name}:"
   for pkg in ${install_list}; do
     log_info "  - ${pkg}"
   done
 
   # Deliberate word-splitting of package list.
   # shellcheck disable=SC2086
-  apk add --no-cache -q -q ${install_list}
-  log_success "Installed ${set_name}"
+  apk add --no-cache -q ${install_list}
+  log_success "Processed ${set_name} with apk"
 }
 
 build_unique_tool_list() {
@@ -504,33 +598,217 @@ build_unique_tool_list() {
     awk '!seen[$0]++'
 }
 
-# Try to install a completion package if it exists
-try_install_completion() {
+completion_package_name() {
   local tool_raw="$1"
   local shell="$2"
   local tool
   tool="$(normalize_package_name "${tool_raw}")"
 
-  # Handle special cases (e.g., docker-cli instead of docker)
-  local pkg_name="${tool}-${shell}-completion"
   case "${tool}" in
   docker)
-    pkg_name="docker-cli-${shell}-completion"
+    printf "%s\n" "docker-cli-${shell}-completion"
+    ;;
+  *)
+    printf "%s\n" "${tool}-${shell}-completion"
     ;;
   esac
+}
 
-  # Search for the completion package
-  if apk search "${pkg_name}" 2>/dev/null | grep -q "^${pkg_name}"; then
-    if is_package_installed "${pkg_name}"; then
-      return 0
-    fi
+completion_package_exists() {
+  local pkg_name="$1"
+  apk search "${pkg_name}" 2>/dev/null | grep -Eq "^${pkg_name}(-[0-9][^[:space:]]*)?$"
+}
 
-    if apk add --no-cache -q -q "${pkg_name}" 2>/dev/null; then
-      log_info "Installed ${pkg_name}"
-      return 0
+discover_completion_packages() {
+  local tools="$1"
+  local shell="$2"
+  local tool
+  local pkg_name
+  local discovered=""
+
+  for tool in ${tools}; do
+    pkg_name="$(completion_package_name "${tool}" "${shell}")"
+    if completion_package_exists "${pkg_name}"; then
+      discovered="${discovered}
+${pkg_name}"
     fi
+  done
+
+  build_unique_tool_list "${discovered}"
+}
+
+install_completion_package_set() {
+  local shell="$1"
+  local package_list="$2"
+  local has_packages=0
+  local pkg
+
+  for pkg in ${package_list}; do
+    has_packages=1
+    break
+  done
+
+  if [ "${has_packages}" != "1" ]; then
+    log_info "No ${shell} completion packages discovered; skipping"
+    return 0
   fi
+
+  log_info "Installing discovered ${shell} completion packages..."
+  # Deliberate word-splitting of package list.
+  # shellcheck disable=SC2086
+  apk add --no-cache -q ${package_list}
+  log_success "Installed discovered ${shell} completion packages"
+}
+
+detect_container_privilege_mode() {
+  local uid_map_inside=""
+  local uid_map_outside=""
+
+  if [ -r /proc/self/uid_map ]; then
+    uid_map_inside="$(awk 'NR == 1 { print $1 }' /proc/self/uid_map 2>/dev/null || true)"
+    uid_map_outside="$(awk 'NR == 1 { print $2 }' /proc/self/uid_map 2>/dev/null || true)"
+  fi
+
+  if [ "${uid_map_inside}" = "0" ] && [ -n "${uid_map_outside}" ]; then
+    if [ "${uid_map_outside}" = "0" ]; then
+      CONTAINER_PRIVILEGE_MODE="privileged"
+    else
+      CONTAINER_PRIVILEGE_MODE="unprivileged"
+    fi
+    return 0
+  fi
+
+  CONTAINER_PRIVILEGE_MODE="unknown"
+  log_warn "Could not determine UID mapping; defaulting to unprivileged-safe storage settings"
+}
+
+detect_container_environment() {
+  local systemd_container=""
+  local product_name=""
+
+  if [ -r /run/systemd/container ]; then
+    systemd_container="$(tr -d '\n' </run/systemd/container 2>/dev/null || true)"
+    case "${systemd_container}" in
+    lxc | lxc-libvirt)
+      CONTAINER_ENVIRONMENT="lxc"
+      return 0
+      ;;
+    esac
+  fi
+
+  if [ -r /proc/1/environ ] && tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -Eq '^container=(lxc|lxc-libvirt)$'; then
+    CONTAINER_ENVIRONMENT="lxc"
+    return 0
+  fi
+
+  if [ -r /proc/1/mountinfo ] && grep -Eq 'lxcfs|/dev/.lxc/' /proc/1/mountinfo 2>/dev/null; then
+    CONTAINER_ENVIRONMENT="lxc"
+    return 0
+  fi
+
+  if [ -r /sys/class/dmi/id/product_name ]; then
+    product_name="$(tr -d '\n' </sys/class/dmi/id/product_name 2>/dev/null || true)"
+    case "${product_name}" in
+    *KVM* | *QEMU* | *VirtualBox* | *VMware* | *Virtual\ Machine* | *HVM\ domU* | *Bochs* | *Standard\ PC* | *Q35*)
+      CONTAINER_ENVIRONMENT="vm"
+      return 0
+      ;;
+    esac
+  fi
+
+  if grep -q 'hypervisor' /proc/cpuinfo 2>/dev/null; then
+    CONTAINER_ENVIRONMENT="vm"
+    return 0
+  fi
+
+  CONTAINER_ENVIRONMENT="unknown"
+  log_warn "Could not determine whether this Alpine host is running in LXC or a VM; keeping guest-agent behavior unchanged"
+}
+
+storage_backend_label_for_mode() {
+  local engine="$1"
+  local mode="$2"
+
+  case "${engine}:${mode}" in
+  docker:privileged)
+    printf '%s\n' 'overlay2'
+    ;;
+  docker:*)
+    printf '%s\n' 'fuse-overlayfs'
+    ;;
+  podman:privileged)
+    printf '%s\n' 'overlay(native)'
+    ;;
+  podman:*)
+    printf '%s\n' 'overlay+fuse-overlayfs'
+    ;;
+  *)
+    printf '%s\n' 'unknown'
+    ;;
+  esac
+}
+
+engine_storage_path() {
+  local engine="$1"
+
+  case "${engine}" in
+  docker)
+    printf '%s\n' '/var/lib/docker'
+    ;;
+  podman)
+    printf '%s\n' '/var/lib/containers/storage'
+    ;;
+  *)
+    printf '%s\n' ''
+    ;;
+  esac
+}
+
+engine_storage_has_state() {
+  local engine="$1"
+  local storage_path
+
+  storage_path="$(engine_storage_path "${engine}")"
+  if [ -z "${storage_path}" ] || [ ! -d "${storage_path}" ]; then
+    return 1
+  fi
+
+  if [ -n "$(ls -A "${storage_path}" 2>/dev/null)" ]; then
+    return 0
+  fi
+
   return 1
+}
+
+guard_storage_backend_transition() {
+  local engine="$1"
+  local previous_mode="${BOOTSTRAP_LXC_PRIVILEGE_MODE:-}"
+  local previous_backend
+  local current_backend
+
+  if [ -z "${previous_mode}" ]; then
+    return 0
+  fi
+
+  previous_backend="$(storage_backend_label_for_mode "${engine}" "${previous_mode}")"
+  current_backend="$(storage_backend_label_for_mode "${engine}" "${CONTAINER_PRIVILEGE_MODE}")"
+
+  if [ "${previous_backend}" = "${current_backend}" ]; then
+    return 0
+  fi
+
+  if ! engine_storage_has_state "${engine}"; then
+    log_warn "UID mapping mode changed (${previous_mode} -> ${CONTAINER_PRIVILEGE_MODE}); switching ${engine} storage backend (${previous_backend} -> ${current_backend}) because no existing engine state was found"
+    return 0
+  fi
+
+  if [ "${FORCE_STORAGE_BACKEND_SWITCH}" = 1 ]; then
+    log_warn "Forcing ${engine} storage backend change (${previous_backend} -> ${current_backend}) after UID mapping mode changed (${previous_mode} -> ${CONTAINER_PRIVILEGE_MODE})"
+    log_warn "Existing ${engine} storage may need manual cleanup if the engine fails to start or read prior images/containers"
+    return 0
+  fi
+
+  die "Refusing to switch ${engine} storage backend (${previous_backend} -> ${current_backend}) because existing engine state was found after UID mapping mode changed (${previous_mode} -> ${CONTAINER_PRIVILEGE_MODE}). Reset ${engine} storage first or re-run with --force-storage-backend-switch if this is intentional."
 }
 
 # Determine the container engine for this host.
@@ -707,8 +985,23 @@ prepare_system() {
 # Package Installation
 # ============================================================================
 
-install_base_tools() {
+base_packages_for_environment() {
   local base_values="${BASE_PACKAGES}"
+
+  if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+    base_values="$(printf '%s\n' "${base_values}" | awk '$1 != "qemu-guest-agent"')"
+  fi
+
+  printf '%s\n' "${base_values}"
+}
+
+install_base_tools() {
+  local base_values
+  base_values="$(base_packages_for_environment)"
+
+  if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+    log_info "Skipping qemu-guest-agent package install (LXC environment detected)"
+  fi
 
   if [ "${INSTALL_FISH}" = 1 ]; then
     base_values="${base_values} ${FISH_OPTIONAL_PACKAGES}"
@@ -728,7 +1021,16 @@ install_optional_bash() {
 }
 
 configure_qemu_guest_agent() {
-  enable_service "qemu-guest-agent" "QEMU guest agent"
+  if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+    log_info "Skipping QEMU guest agent service enablement (LXC environment detected)"
+    return 0
+  fi
+
+  # Guest agent integration is useful when available, but some Alpine
+  # environments are not actually running as QEMU/KVM guests and the service
+  # may fail to start. Treat this as best-effort so the rest of bootstrap
+  # continues and engine/tool installation still runs.
+  enable_service "qemu-guest-agent" "QEMU guest agent" || true
 }
 
 configure_podman_compat() {
@@ -756,13 +1058,26 @@ EOF
 install_podman() {
   install_package_set "podman packages" "${PODMAN_PACKAGES}" "${TESTING_REPOS_ENABLED}"
 
-  # Use fuse-overlayfs-backed overlay storage for Podman in ZFS-backed LXC.
   ensure_toml_key /etc/containers/storage.conf '[storage]' 'driver' '"overlay"'
-  ensure_toml_key /etc/containers/storage.conf '[storage.options.overlay]' 'mount_program' '"/usr/bin/fuse-overlayfs"'
+  case "${CONTAINER_PRIVILEGE_MODE}" in
+  privileged)
+    remove_toml_key /etc/containers/storage.conf '[storage.options.overlay]' 'mount_program'
+    log_info "Configured Podman for native overlay storage (privileged UID mapping detected)"
+    if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+      log_warn "Privileged Proxmox LXCs usually need host-side overlay support and lxc.apparmor.profile=unconfined for Podman overlay mounts"
+    fi
+    ;;
+  *)
+    ensure_toml_key /etc/containers/storage.conf '[storage.options.overlay]' 'mount_program' '"/usr/bin/fuse-overlayfs"'
+    log_info "Configured Podman to use fuse-overlayfs-backed overlay storage"
+    ;;
+  esac
 
-  # Enable required services
-  enable_service "cgroups" "cgroups"
-  enable_service "podman" "Podman"
+  # Enable runtime services when available. On some Alpine/container
+  # environments these services may be absent or fail to start during
+  # bootstrap; installation should still succeed.
+  enable_service "cgroups" "cgroups" || true
+  enable_service "podman" "Podman" || true
 
   configure_podman_compat
 
@@ -772,12 +1087,25 @@ install_podman() {
 install_docker() {
   install_package_set "docker packages" "${DOCKER_PACKAGES}" "${TESTING_REPOS_ENABLED}"
 
-  # Use fuse-overlayfs storage driver for Docker in ZFS-backed LXC.
-  ensure_docker_storage_driver
+  case "${CONTAINER_PRIVILEGE_MODE}" in
+  privileged)
+    ensure_docker_storage_driver "overlay2"
+    log_info "Configured Docker for native overlay2 storage (privileged UID mapping detected)"
+    if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+      log_warn "Privileged Proxmox LXCs usually need host-side overlay support and lxc.apparmor.profile=unconfined for Docker overlay2 mounts"
+    fi
+    ;;
+  *)
+    ensure_docker_storage_driver "fuse-overlayfs"
+    log_info "Configured Docker to use fuse-overlayfs storage"
+    ;;
+  esac
 
-  # Enable required services
-  enable_service "cgroups" "cgroups"
-  enable_service "docker" "Docker"
+  # Enable runtime services when available. On some Alpine/container
+  # environments these services may be absent or fail to start during
+  # bootstrap; installation should still succeed.
+  enable_service "cgroups" "cgroups" || true
+  enable_service "docker" "Docker" || true
 
   # Ensure docker.sock is properly created and accessible
   if [ -S /var/run/docker.sock ]; then
@@ -791,6 +1119,8 @@ install_docker() {
 install_completions() {
   local consolidated_packages="$1"
   local tools
+  local fish_completion_packages=""
+  local bash_completion_packages=""
 
   log_info "Installing shell completions from Alpine packages..."
 
@@ -798,9 +1128,8 @@ install_completions() {
 
   # Install fish completions only when fish tooling is enabled.
   if [ "${INSTALL_FISH}" = 1 ]; then
-    for tool in ${tools}; do
-      try_install_completion "${tool}" "fish" || true
-    done
+    fish_completion_packages="$(discover_completion_packages "${tools}" "fish")"
+    install_completion_package_set "fish" "${fish_completion_packages}"
   fi
 
   # Install bash completions only if --install-bash was specified
@@ -816,9 +1145,8 @@ EOF
       chmod 644 /etc/profile.d/bash_completion.sh
     fi
 
-    for tool in ${tools}; do
-      try_install_completion "${tool}" "bash" || true
-    done
+    bash_completion_packages="$(discover_completion_packages "${tools}" "bash")"
+    install_completion_package_set "bash" "${bash_completion_packages}"
   fi
 
   log_success "Shell completions configured"
@@ -1021,6 +1349,91 @@ EOF
   log_success "Shared aliases configured"
 }
 
+configure_login_fastfetch() {
+  log_info "Configuring login-time fastfetch..."
+
+  mkdir -p /etc/profile.d
+  cat >/etc/profile.d/fastfetch-login.sh <<'EOF'
+# Show fastfetch once for interactive login shells when available.
+if [ -z "${ALPINE_BOOTSTRAP_FASTFETCH_SHOWN:-}" ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    case "$-" in
+        *i*)
+            if command -v fastfetch >/dev/null 2>&1; then
+                export ALPINE_BOOTSTRAP_FASTFETCH_SHOWN=1
+                fastfetch
+            fi
+            ;;
+    esac
+fi
+EOF
+  chmod 644 /etc/profile.d/fastfetch-login.sh
+
+  if [ "${INSTALL_FISH}" = 1 ]; then
+    mkdir -p /etc/fish/conf.d
+    cat >/etc/fish/conf.d/fastfetch-login.fish <<'EOF'
+# Show fastfetch once for interactive fish login shells when available.
+if status is-interactive; and status is-login; and not set -q ALPINE_BOOTSTRAP_FASTFETCH_SHOWN; and test "$TERM" != dumb; and command -sq fastfetch
+    set -gx ALPINE_BOOTSTRAP_FASTFETCH_SHOWN 1
+    fastfetch
+end
+EOF
+    chmod 644 /etc/fish/conf.d/fastfetch-login.fish
+  fi
+
+  log_success "Login-time fastfetch configured"
+}
+
+configure_motd() {
+  log_info "Generating /etc/motd..."
+
+  local testing_repos_label="disabled"
+  local shells_label="ash"
+  local engine_command
+
+  if [ "${TESTING_REPOS_ENABLED}" = 1 ]; then
+    testing_repos_label="enabled"
+  fi
+
+  if [ "${INSTALL_BASH}" = 1 ]; then
+    shells_label="${shells_label}, bash"
+  fi
+
+  if [ "${INSTALL_FISH}" = 1 ]; then
+    shells_label="${shells_label}, fish"
+  fi
+
+  engine_command="${SELECTED_ENGINE}"
+  if [ -z "${engine_command}" ]; then
+    engine_command="unknown"
+  fi
+
+  cat >/etc/motd <<EOF
+Alpine AI Host
+==============
+
+Bootstrap state
+- Engine: ${engine_command}
+- Runtime environment: ${CONTAINER_ENVIRONMENT}
+- Container privilege mode: ${CONTAINER_PRIVILEGE_MODE}
+- Testing repositories: ${testing_repos_label}
+- Configured shells: ${shells_label}
+- State file: ${STATE_FILE}
+
+Login behavior
+- Interactive logins run fastfetch when it is installed.
+
+Useful checks
+- ${engine_command} info
+- rc-status
+- cat /etc/apk/repositories
+- cat ${STATE_FILE}
+- fastfetch
+EOF
+  chmod 644 /etc/motd
+
+  log_success "/etc/motd updated"
+}
+
 # ============================================================================
 # State Persistence
 # ============================================================================
@@ -1035,8 +1448,10 @@ save_state() {
 BOOTSTRAP_ENGINE="${engine}"
 BOOTSTRAP_INSTALL_BASH="${INSTALL_BASH}"
 BOOTSTRAP_INSTALL_FISH="${INSTALL_FISH}"
+BOOTSTRAP_LXC_PRIVILEGE_MODE="${CONTAINER_PRIVILEGE_MODE}"
+BOOTSTRAP_RUNTIME_ENVIRONMENT="${CONTAINER_ENVIRONMENT}"
 BOOTSTRAP_LAST_RUN="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-BOOTSTRAP_VERSION="1.0"
+BOOTSTRAP_VERSION="1.2"
 EOF
   chmod 644 "${STATE_FILE}"
   log_success "State persisted to ${STATE_FILE}"
@@ -1066,13 +1481,24 @@ main() {
   log_section "========================================"
   log_info ""
 
+  # Determine runtime characteristics up front so package/service decisions and
+  # storage settings match the current environment.
+  detect_container_environment
+  detect_container_privilege_mode
+
   # Determine engine (sets SELECTED_ENGINE global; no subshell/stdout capture)
   determine_engine
   local engine="${SELECTED_ENGINE}"
 
+  # Guard against risky backend flips when an existing engine data directory is
+  # present and the UID mapping mode changed since the last bootstrap.
+  guard_storage_backend_transition "${engine}"
+
   log_info ""
   log_section "Configuration"
   log_info "Container engine: ${C_BOLD}${engine}${C_RESET}"
+  log_info "Runtime environment: ${C_BOLD}${CONTAINER_ENVIRONMENT}${C_RESET}"
+  log_info "UID mapping mode: ${C_BOLD}${CONTAINER_PRIVILEGE_MODE}${C_RESET}"
   log_info "GitHub user: ${GITHUB_USER}"
   if [ "${DISABLE_TESTING_REPOS}" = 0 ]; then
     log_info "Testing repos: ${C_GREEN}ENABLED${C_RESET}"
@@ -1088,6 +1514,11 @@ main() {
     log_info "setup-apkrepos helper: ${C_GREEN}ENABLED${C_RESET}"
   else
     log_info "setup-apkrepos helper: ${C_YELLOW}SKIPPED${C_RESET} (default; use --run-setup-apkrepos)"
+  fi
+  if [ "${FORCE_STORAGE_BACKEND_SWITCH}" = 1 ]; then
+    log_info "Storage backend switch guard: ${C_YELLOW}FORCED${C_RESET} (--force-storage-backend-switch)"
+  else
+    log_info "Storage backend switch guard: ${C_GREEN}ENABLED${C_RESET}"
   fi
   if [ "${INSTALL_BASH}" = 1 ]; then
     log_info "Bash tooling: ${C_GREEN}ENABLED${C_RESET}"
@@ -1135,7 +1566,7 @@ main() {
     selected_engine_packages=""
     ;;
   esac
-  consolidated_packages="${BASE_PACKAGES} ${selected_engine_packages}"
+  consolidated_packages="$(base_packages_for_environment) ${selected_engine_packages}"
   if [ "${INSTALL_FISH}" = 1 ]; then
     consolidated_packages="${consolidated_packages} ${FISH_OPTIONAL_PACKAGES}"
   fi
@@ -1165,9 +1596,13 @@ main() {
   # Shell configuration
   configure_shell
   configure_bash_shell
+  configure_login_fastfetch
 
   # Save state
   save_state "${engine}"
+
+  # Login banner
+  configure_motd
 
   log_info ""
   log_section "========================================"
@@ -1181,8 +1616,13 @@ main() {
     log_info "Testing repos: ${C_RED}DISABLED${C_RESET}"
   fi
   log_info "State file: ${STATE_FILE}"
-  log_info "Proxmox reminder: ensure CT config includes features: fuse=1,keyctl=1,nesting=1"
-  log_info "Check: /etc/pve/lxc/<CTID>.conf"
+  if [ "${CONTAINER_ENVIRONMENT}" = "lxc" ]; then
+    log_info "Proxmox reminder: run pct set <CTID> --features nesting=1,keyctl=1"
+    log_info "Proxmox reminder: ensure /etc/pve/lxc/<CTID>.conf contains lxc.apparmor.profile: unconfined"
+    log_info "Proxmox reminder: ensure /etc/pve/lxc/<CTID>.conf contains lxc.cap.drop: "
+    log_info "Proxmox reminder: ensure /etc/pve/lxc/<CTID>.conf contains lxc.cgroup.relative: 0"
+    log_info "Check: /etc/pve/lxc/<CTID>.conf"
+  fi
   log_info ""
 }
 
